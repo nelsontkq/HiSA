@@ -21,10 +21,7 @@ from utils import CTCLabelConverter, AttnLabelConverter, Averager
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def train(opt):
-    # Initialize wandb
-    wandb.init(project="micr-ocr", config=vars(opt))
-
+def load_data(opt):
     """dataset preparation"""
     train_dataset = MICRDataset(
         opt.train_data,
@@ -64,6 +61,16 @@ def train(opt):
         pin_memory=True,
     )
 
+    return train_loader, valid_loader
+
+
+def train(opt):
+    # Initialize wandb
+    wandb.init(project="micr-ocr", config=vars(opt))
+
+    # Load data
+    train_loader, valid_loader = load_data(opt)
+
     """ model configuration """
     if "CTC" in opt.Prediction:
         converter = CTCLabelConverter(opt.character)
@@ -96,13 +103,14 @@ def train(opt):
     else:
         criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)
 
-    """ setup optimizer """
+    # filtered parameters
     filtered_parameters = []
     params_num = []
     for p in filter(lambda p: p.requires_grad, model.parameters()):
         filtered_parameters.append(p)
         params_num.append(np.prod(p.size()))
 
+    # setup optimizer
     optimizer = optim.Adam(filtered_parameters, lr=opt.lr, betas=(opt.beta1, 0.999))
     scheduler = optim.lr_scheduler.StepLR(
         optimizer, step_size=opt.lr_decay_step, gamma=0.1
@@ -115,10 +123,8 @@ def train(opt):
     i = 0
 
     for epoch in range(opt.num_epoch):
-        model.train()
-        train_loss = 0
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{opt.num_epoch}")
-        for data in train_pbar:
+        for data in tqdm(train_loader):
+            # train part
             image_tensors, labels = data
             image = image_tensors.to(device)
             text, length = converter.encode(
@@ -127,10 +133,23 @@ def train(opt):
             batch_size = image.size(0)
 
             if "CTC" in opt.Prediction:
-                preds = model(image, text)
+                preds = model(image, text).log_softmax(2)
                 preds_size = torch.IntTensor([preds.size(1)] * batch_size)
-                preds = preds.log_softmax(2).permute(1, 0, 2)
+                preds = preds.permute(1, 0, 2)  # to use CTCLoss format
+
+                # Calculate max_length for this batch
+                max_length = max(length).item()
+
+                # Resize text tensor to match the prediction length
+                if max_length < preds.size(0):
+                    text = text[:, :max_length]
+                else:
+                    preds = torch.nn.functional.pad(
+                        preds, (0, 0, 0, 0, 0, max_length - preds.size(0))
+                    )
+
                 cost = criterion(preds, text, preds_size, length)
+
             else:
                 preds = model(image, text[:, :-1])  # align with Attention.forward
                 target = text[:, 1:]  # without [GO] Symbol
@@ -143,51 +162,49 @@ def train(opt):
             torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
             optimizer.step()
 
-            train_loss += cost.item()
-            train_pbar.set_postfix({"Loss": cost.item()})
+            # validation part
+            if i % opt.valInterval == 0:
+                elapsed_time = time.time() - start_time
+                print(
+                    f"[{i}/{len(train_loader)}] Loss: {cost.item():0.5f} elapsed_time: {elapsed_time:0.5f}"
+                )
+                start_time = time.time()
+
+                model.eval()
+                with torch.no_grad():
+                    valid_loss, current_accuracy, current_norm_ED, _, _, _, _, _ = (
+                        validation(model, criterion, valid_loader, converter, opt)
+                    )
+                model.train()
+
+                # keep best accuracy model
+                if current_accuracy > best_accuracy:
+                    best_accuracy = current_accuracy
+                    torch.save(
+                        model.state_dict(), f"{opt.saved_model}/best_accuracy.pth"
+                    )
+                if current_norm_ED > best_norm_ED:
+                    best_norm_ED = current_norm_ED
+                    torch.save(
+                        model.state_dict(), f"{opt.saved_model}/best_norm_ED.pth"
+                    )
+
+                # log to wandb
+                wandb.log(
+                    {
+                        "train_loss": cost.item(),
+                        "valid_loss": valid_loss,
+                        "accuracy": current_accuracy,
+                        "norm_ED": current_norm_ED,
+                        "epoch": epoch,
+                    }
+                )
 
             i += 1
-            if i % opt.saveInterval == 0:
-                torch.save(model.state_dict(), f"{opt.saved_model}/iter_{i}.pth")
-
-        train_loss /= len(train_loader)
-        wandb.log({"train_loss": train_loss, "epoch": epoch})
 
         scheduler.step()
 
-        # validation
-        model.eval()
-        with torch.no_grad():
-            valid_loss, current_accuracy, current_norm_ED = validation(
-                model, criterion, valid_loader, converter, opt
-            )
-
-        print(
-            f"Epoch {epoch+1}/{opt.num_epoch}, "
-            f"Train loss: {train_loss:.5f}, "
-            f"Valid loss: {valid_loss:.5f}, "
-            f"Accuracy: {current_accuracy:.5f}, "
-            f"Norm ED: {current_norm_ED:.5f}"
-        )
-
-        wandb.log(
-            {
-                "valid_loss": valid_loss,
-                "accuracy": current_accuracy,
-                "norm_ED": current_norm_ED,
-                "epoch": epoch,
-            }
-        )
-
-        # keep best accuracy model
-        if current_accuracy > best_accuracy:
-            best_accuracy = current_accuracy
-            torch.save(model.state_dict(), f"{opt.saved_model}/best_accuracy.pth")
-        if current_norm_ED > best_norm_ED:
-            best_norm_ED = current_norm_ED
-            torch.save(model.state_dict(), f"{opt.saved_model}/best_norm_ED.pth")
-
-    print("Training finished")
+    print("end the training")
     wandb.finish()
 
 
