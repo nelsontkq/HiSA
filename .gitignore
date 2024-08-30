@@ -1,3 +1,7 @@
 *.tif
 *.jpg
+data/*
 raw_data/
+output/*
+wandb/*
+__pycache__

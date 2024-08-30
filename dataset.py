@@ -5,42 +5,52 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 
+
 class MICRDataset(Dataset):
-    def __init__(self, root_dir, mode='train', max_length=25, img_height=64, img_width=200):
-        """
-        Args:
-            root_dir (string): Directory with all the images and labels.csv file.
-            mode (string): 'train' or 'val' to specify the dataset mode.
-            max_length (int): Maximum length of the label sequence.
-            img_height (int): Height to resize the images to.
-            img_width (int): Width to resize the images to.
-        """
+    def __init__(
+        self,
+        root_dir,
+        select_data,
+        batch_ratio,
+        mode,
+        max_length,
+        img_height,
+        img_width,
+        character,
+        data=None,
+    ):
         self.root_dir = root_dir
         self.mode = mode
         self.max_length = max_length
         self.img_height = img_height
         self.img_width = img_width
 
-        # Read the labels file
-        labels_file = os.path.join(root_dir, 'labels.csv')
-        self.data = pd.read_csv(labels_file)
+        if data is None:
+            # Read the labels file
+            labels_file = os.path.join(root_dir, "labels.csv")
+            self.data = pd.read_csv(labels_file)
+        else:
+            self.data = data
 
         # Create a character to index mapping
-        self.char_to_idx = {char: idx for idx, char in enumerate('0123456789⑆⑇⑈⑉')}
+        self.char_to_idx = {char: idx for idx, char in enumerate(character)}
+        self.idx_to_char = {idx: char for char, idx in self.char_to_idx.items()}
 
         # Define image transformations
-        self.transform = transforms.Compose([
-            transforms.Resize((img_height, img_width)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5], std=[0.5])
-        ])
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((img_height, img_width)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5], std=[0.5]),
+            ]
+        )
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         img_name = os.path.join(self.root_dir, self.data.iloc[idx, 0])
-        image = Image.open(img_name).convert('L')  # Convert to grayscale
+        image = Image.open(img_name).convert("L")  # Convert to grayscale
         image = self.transform(image)
 
         label = self.data.iloc[idx, 1]
@@ -54,17 +64,23 @@ class MICRDataset(Dataset):
 
     def decode_label(self, label_indices):
         """Convert list of indices back to string label."""
-        idx_to_char = {v: k for k, v in self.char_to_idx.items()}
-        return ''.join([idx_to_char[idx] for idx in label_indices])
+        return "".join(
+            [self.idx_to_char[idx] for idx in label_indices if idx in self.idx_to_char]
+        )
 
     def collate_fn(self, batch):
         images, labels = zip(*batch)
-        
-        # Pad the labels to max_length
-        labels = [torch.LongTensor(label + [0] * (self.max_length - len(label))) for label in labels]
-        
-        # Stack images and labels
+
+        # Find max label length in this batch
+        max_label_length = max(len(label) for label in labels)
+
+        # Pad labels to max_label_length
+        padded_labels = [
+            label + [0] * (max_label_length - len(label)) for label in labels
+        ]
+
+        # Convert to tensor
         images = torch.stack(images, 0)
-        labels = torch.stack(labels, 0)
+        labels = torch.LongTensor(padded_labels)
 
         return images, labels

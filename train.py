@@ -8,20 +8,24 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data
+import torch.backends.cudnn as cudnn
 import numpy as np
 from tqdm import tqdm
 import wandb
+import Levenshtein
 
 from model import Model
 from dataset import MICRDataset
 from utils import CTCLabelConverter, AttnLabelConverter, Averager
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def train(opt):
-    """dataset preparation"""
+    # Initialize wandb
     wandb.init(project="micr-ocr", config=vars(opt))
+
+    """dataset preparation"""
     train_dataset = MICRDataset(
         opt.train_data,
         opt.select_data,
@@ -54,7 +58,7 @@ def train(opt):
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset,
         batch_size=opt.batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=int(opt.workers),
         collate_fn=valid_dataset.collate_fn,
         pin_memory=True,
@@ -90,9 +94,7 @@ def train(opt):
     if "CTC" in opt.Prediction:
         criterion = torch.nn.CTCLoss(zero_infinity=True).to(device)
     else:
-        criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(
-            device
-        )  # ignore [GO] token = ignore index 0
+        criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)
 
     """ setup optimizer """
     filtered_parameters = []
@@ -113,7 +115,10 @@ def train(opt):
     i = 0
 
     for epoch in range(opt.num_epoch):
-        for data in train_loader:
+        model.train()
+        train_loss = 0
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{opt.num_epoch}")
+        for data in train_pbar:
             image_tensors, labels = data
             image = image_tensors.to(device)
             text, length = converter.encode(
@@ -138,34 +143,40 @@ def train(opt):
             torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
             optimizer.step()
 
-            i += 1
-            if i % opt.valInterval == 0:
-                elapsed_time = time.time() - start_time
-                print(
-                    f"[{i}/{len(train_loader)}] Loss: {cost.item():0.5f} elapsed_time: {elapsed_time:0.5f}"
-                )
-                start_time = time.time()
+            train_loss += cost.item()
+            train_pbar.set_postfix({"Loss": cost.item()})
 
+            i += 1
             if i % opt.saveInterval == 0:
                 torch.save(model.state_dict(), f"{opt.saved_model}/iter_{i}.pth")
+
+        train_loss /= len(train_loader)
+        wandb.log({"train_loss": train_loss, "epoch": epoch})
 
         scheduler.step()
 
         # validation
+        model.eval()
         with torch.no_grad():
-            (
-                valid_loss,
-                current_accuracy,
-                current_norm_ED,
-                preds,
-                confidence_score,
-                labels,
-                infer_time,
-                length_of_data,
-            ) = validation(model, criterion, valid_loader, converter, opt)
+            valid_loss, current_accuracy, current_norm_ED = validation(
+                model, criterion, valid_loader, converter, opt
+            )
 
         print(
-            f"Valid loss: {valid_loss:0.5f}, Accuracy: {current_accuracy:0.5f}, Norm ED: {current_norm_ED:0.5f}"
+            f"Epoch {epoch+1}/{opt.num_epoch}, "
+            f"Train loss: {train_loss:.5f}, "
+            f"Valid loss: {valid_loss:.5f}, "
+            f"Accuracy: {current_accuracy:.5f}, "
+            f"Norm ED: {current_norm_ED:.5f}"
+        )
+
+        wandb.log(
+            {
+                "valid_loss": valid_loss,
+                "accuracy": current_accuracy,
+                "norm_ED": current_norm_ED,
+                "epoch": epoch,
+            }
         )
 
         # keep best accuracy model
@@ -177,6 +188,60 @@ def train(opt):
             torch.save(model.state_dict(), f"{opt.saved_model}/best_norm_ED.pth")
 
     print("Training finished")
+    wandb.finish()
+
+
+def validation(model, criterion, valid_loader, converter, opt):
+    model.eval()
+    with torch.no_grad():
+        valid_loss = 0
+        current_accuracy = 0
+        current_norm_ED = 0
+        valid_pbar = tqdm(valid_loader, desc="Validation")
+        for data in valid_pbar:
+            image_tensors, labels = data
+            image = image_tensors.to(device)
+            text, length = converter.encode(
+                labels, batch_max_length=opt.batch_max_length
+            )
+            batch_size = image.size(0)
+
+            if "CTC" in opt.Prediction:
+                preds = model(image, text)
+                preds_size = torch.IntTensor([preds.size(1)] * batch_size)
+                preds = preds.log_softmax(2).permute(1, 0, 2)
+                cost = criterion(preds, text, preds_size, length)
+
+                _, preds = preds.max(2)
+                preds = preds.transpose(1, 0).contiguous().view(-1)
+            else:
+                preds = model(image, text[:, :-1])  # align with Attention.forward
+                target = text[:, 1:]  # without [GO] Symbol
+                cost = criterion(
+                    preds.view(-1, preds.shape[-1]), target.contiguous().view(-1)
+                )
+
+                _, preds_index = preds.max(2)
+
+            valid_loss += cost.item()
+
+            # Calculate accuracy and norm_ED
+            preds_str = converter.decode(preds.data, preds_size.data)
+            for pred, gt in zip(preds_str, labels):
+                if pred == gt:
+                    current_accuracy += 1
+                if len(gt) == 0:
+                    current_norm_ED += 1
+                else:
+                    current_norm_ED += 1 - Levenshtein.distance(pred, gt) / max(
+                        len(pred), len(gt)
+                    )
+
+    valid_loss /= len(valid_loader)
+    current_accuracy /= len(valid_loader.dataset)
+    current_norm_ED /= len(valid_loader.dataset)
+
+    return valid_loss, current_accuracy, current_norm_ED
 
 
 if __name__ == "__main__":
@@ -250,7 +315,7 @@ if __name__ == "__main__":
         "--hidden_size", type=int, default=256, help="the size of the LSTM hidden state"
     )
     parser.add_argument(
-        "--character", type=str, default="0123456789⑆⑇⑈⑉", help="character label"
+        "--character", type=str, default="0123456789⑆⑇⑈⑉ ", help="character label"
     )
     parser.add_argument(
         "--saved_model",
