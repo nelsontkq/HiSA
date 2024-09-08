@@ -136,13 +136,14 @@ def evaluate(model, data_loader, criterion, device, tokenizer):
 
 
 def main():
-    batch_size = 128
+    # 1 V100
+    batch_size = 145
     num_epochs = 30
-    d_model = 768
+    d_model = 600
     nhead = 12
-    num_layers = 12
+    num_layers = 10
     dropout = 0.1
-    lr = 5e-5
+    lr = 1e-4
     vocab_size = 32000
     seq_length = 512
 
