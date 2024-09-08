@@ -47,7 +47,7 @@ def get_tokenizer(vocab_size=32000, max_sentence_length=8384):
                         # find middle space and split
                         split_idx = line.rfind(" ", 0, max_sentence_length)
                         f.write(line[:split_idx] + "\n")
-                        f.write(line[split_idx + 1:] + "\n")
+                        f.write(line[split_idx + 1 :] + "\n")
                     else:
                         f.write(line + "\n")
 
@@ -66,17 +66,26 @@ def get_tokenizer(vocab_size=32000, max_sentence_length=8384):
         sp = spm.SentencePieceProcessor()
         sp.load(f"wikitext_sp_{vocab_size}.model")
 
-
     return sp, sp.get_piece_size()
 
 
-def get_dataloaders(tokenizer, batch_size, seq_length):
+def get_dataloaders(tokenizer, batch_size, seq_length, num_workers=4):
     train_dataset = WikiTextDataset("train", tokenizer, seq_length)
     val_dataset = WikiTextDataset("validation", tokenizer, seq_length)
     test_dataset = WikiTextDataset("test", tokenizer, seq_length)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True
+    )
 
     return train_loader, val_loader, test_loader

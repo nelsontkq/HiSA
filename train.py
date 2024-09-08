@@ -5,7 +5,8 @@ import torch.nn as nn
 import wandb
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
-
+from torch.cuda.amp import autocast, GradScaler
+from torch.profiler import profile, record_function, ProfilerActivity
 from hisa_model import HiSAGPT
 from ds import get_tokenizer, get_dataloaders
 
@@ -33,57 +34,85 @@ def train(
     device,
     num_epochs,
     tokenizer,
+    accumulation_steps=2,
 ):
+    scaler = GradScaler()
     best_val_loss = float("inf")
-    for epoch in range(num_epochs):
-        model.train()
-        total_loss = 0
-        total_words = 0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-            inputs = batch.to(device)
-            targets = inputs.clone()
-            targets[:, :-1] = inputs[:, 1:]
-            targets[:, -1] = tokenizer.pad_id()
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True
+    ) as prof:
+        with record_function("model_training"):
+            for epoch in range(num_epochs):
+                model.train()
+                total_loss = 0
+                total_words = 0
+                optimizer.zero_grad()
+                for i, batch in enumerate(
+                    tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+                ):
+                    inputs = batch.to(device)
+                    targets = inputs.clone()
+                    targets[:, :-1] = inputs[:, 1:]
+                    targets[:, -1] = tokenizer.pad_id()
+                    with autocast():
+                        output = model(inputs)
+                        loss = criterion(
+                            output.view(-1, output.size(-1)), targets.view(-1)
+                        )
+                        loss = loss / accumulation_steps
+                    scaler.scale(loss).backward()
+                    if (i + 1) % accumulation_steps == 0:
+                        scaler.unscale_(optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_norm=1.0
+                        )
+                        wandb.log({"grad_norm": grad_norm})
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                        scheduler.step()
+                    total_loss += loss.item() * accumulation_steps * targets.numel()
+                    total_words += targets.numel()
 
-            optimizer.zero_grad()
-            output = model(inputs)
-            loss = criterion(output.view(-1, output.size(-1)), targets.view(-1))
-            loss.backward()
+                avg_train_loss = total_loss / total_words
+                train_perplexity = math.exp(avg_train_loss)
+                val_loss, val_perplexity = evaluate(
+                    model, val_loader, criterion, device, tokenizer
+                )
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            wandb.log({"grad_norm": grad_norm})
-            optimizer.step()
-            scheduler.step()
-            total_loss += loss.item() * targets.numel()
-            total_words += targets.numel()
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "train_loss": avg_train_loss,
+                        "train_perplexity": train_perplexity,
+                        "val_loss": val_loss,
+                        "val_perplexity": val_perplexity,
+                        "learning_rate": scheduler.get_last_lr()[0],
+                    }
+                )
 
-        avg_train_loss = total_loss / total_words
-        train_perplexity = math.exp(avg_train_loss)
-        val_loss, val_perplexity = evaluate(
-            model, val_loader, criterion, device, tokenizer
-        )
+                print(
+                    f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Train Perplexity: {train_perplexity:.4f}, Val Loss: {val_loss:.4f}, Val Perplexity: {val_perplexity:.4f}"
+                )
 
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train_loss": avg_train_loss,
-                "train_perplexity": train_perplexity,
-                "val_loss": val_loss,
-                "val_perplexity": val_perplexity,
-                "learning_rate": scheduler.get_last_lr()[0],
-            }
-        )
+                print(
+                    prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
+                )
+                prof.export_chrome_trace("trace.json")
+                wandb.log(
+                    {
+                        "profiler": prof.key_averages().table(
+                            sort_by="cuda_time_total", row_limit=10
+                        )
+                    }
+                )
 
-        print(
-            f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Train Perplexity: {train_perplexity:.4f}, Val Loss: {val_loss:.4f}, Val Perplexity: {val_perplexity:.4f}"
-        )
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(
-                model.state_dict(), f"best_{ model.__class__.__name__}_model.pth"
-            )
-            print("Best model saved!")
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save(
+                        model.state_dict(), f"best_{model.__class__.__name__}_model.pth"
+                    )
+                    print("Best model saved!")
 
 
 def evaluate(model, data_loader, criterion, device, tokenizer):
@@ -115,7 +144,7 @@ def main():
     dropout = 0.1
     lr = 5e-5
     vocab_size = 32000
-    seq_length = 2048
+    seq_length = 512
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

@@ -36,29 +36,31 @@ class SparseMultiheadAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
 
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = dropout
         self.sparsity = sparsity
 
     def forward(self, query, key, value):
-        batch_size = query.size(0)
+        batch_size, seq_len, _ = query.shape
 
         Q = self.W_q(query).view(batch_size, -1, self.nhead, self.d_k).transpose(1, 2)
         K = self.W_k(key).view(batch_size, -1, self.nhead, self.d_k).transpose(1, 2)
         V = self.W_v(value).view(batch_size, -1, self.nhead, self.d_k).transpose(1, 2)
 
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        mask = (
+            torch.rand((batch_size, self.nhead, seq_len, seq_len), device=query.device)
+            > self.sparsity
+        )
 
-        # Apply sparsity
-        mask = torch.rand_like(attn_scores) > self.sparsity
-        attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+        attn_output = F.scaled_dot_product_attention(
+            Q, K, V, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0
+        )
 
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
-
-        output = torch.matmul(attn_probs, V)
-        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-
-        return self.W_o(output)
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, seq_len, self.d_model)
+        )
+        return self.W_o(attn_output)
 
 
 class FeedForward(nn.Module):
@@ -109,7 +111,9 @@ class HiSAForPTB(nn.Module):
 
 
 class HiSAGPT(nn.Module):
-    def __init__(self, vocab_size, d_model, nhead, num_layers, dropout):
+    def __init__(
+        self, vocab_size, d_model, nhead, num_layers, dropout, use_checkpoint=False
+    ):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoder = PositionalEncoding(d_model, dropout)
@@ -119,6 +123,7 @@ class HiSAGPT(nn.Module):
         )
         self.fc_out = nn.Linear(d_model, vocab_size)
         self.vocab_size = vocab_size
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, src):
         if src.max() >= self.vocab_size or src.min() < 0:
@@ -129,7 +134,10 @@ class HiSAGPT(nn.Module):
         x = self.embedding(src) * math.sqrt(self.d_model)
         x = self.pos_encoder(x)
         for block in self.transformer_blocks:
-            x = block(x)
+            if self.use_checkpoint:
+                x = checkpoint(block, x)
+            else:
+                x = block(x)
         return self.fc_out(x)
 
     def generate(self, input_ids, max_length):
