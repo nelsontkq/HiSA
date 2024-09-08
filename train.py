@@ -107,15 +107,15 @@ def evaluate(model, data_loader, criterion, device, tokenizer):
 
 
 def main():
-    batch_size = 56
-    num_epochs = 20
-    d_model = 132
-    nhead = 6
-    num_layers = 6
+    batch_size = 128  # Reduced due to increased sequence length
+    num_epochs = 30
+    d_model = 768     # Increased to handle longer sequences
+    nhead = 12        # Increased for more parallel attention
+    num_layers = 12
     dropout = 0.1
-    lr = 3e-4
+    lr = 5e-5         # Further reduced for stability with longer sequences
     vocab_size = 32000
-    seq_length = 256
+    seq_length = 2048  # Increased as requested
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
