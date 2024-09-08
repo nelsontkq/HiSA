@@ -106,3 +106,35 @@ class HiSAForPTB(nn.Module):
         for block in self.transformer_blocks:
             x = block(x)
         return self.fc_out(x)
+
+
+class HiSAGPT(nn.Module):
+    def __init__(self, vocab_size, d_model, nhead, num_layers, dropout):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        self.d_model = d_model
+        self.transformer_blocks = nn.ModuleList(
+            [HiSABlock(d_model, nhead, dropout) for _ in range(num_layers)]
+        )
+        self.fc_out = nn.Linear(d_model, vocab_size)
+        self.vocab_size = vocab_size
+
+    def forward(self, src):
+        if src.max() >= self.vocab_size or src.min() < 0:
+            raise ValueError(
+                f"Input contains token IDs outside the valid range [0, {self.vocab_size-1}]"
+            )
+
+        x = self.embedding(src) * math.sqrt(self.d_model)
+        x = self.pos_encoder(x)
+        for block in self.transformer_blocks:
+            x = block(x)
+        return self.fc_out(x)
+
+    def generate(self, input_ids, max_length):
+        for _ in range(max_length):
+            output = self(input_ids)
+            next_token = output[:, -1, :].argmax(dim=-1)
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
+        return input_ids
