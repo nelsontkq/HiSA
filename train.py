@@ -11,7 +11,15 @@ import wandb
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
-from model import HiSAForPTB
+from transformer_model import TransformerForPTB
+from hisa_model import HiSAForPTB
+
+
+def get_model(vocab_len, d_model, nhead, num_layers, dropout, name):
+    if name.startswith("transformer"):
+        return TransformerForPTB(vocab_len, d_model, nhead, num_layers, dropout)
+    if name.startswith("hisa"):
+        return HiSAForPTB(vocab_len, d_model, nhead, num_layers, dropout)
 
 
 def yield_tokens(data_iter):
@@ -77,8 +85,8 @@ def train(
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
-        total_f1 = 0
         num_batches = 0
+        total_words = 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             inputs, targets = batch
             optimizer.zero_grad()
@@ -87,90 +95,64 @@ def train(
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             wandb.log({"grad_norm": grad_norm})
+
             optimizer.step()
             scheduler.step()
-            total_loss += loss.item()
-            f1 = calculate_f1(output, targets, vocab)
-            total_f1 += f1
+            total_loss += loss.item() * targets.numel()
+            total_words += targets.numel()
             num_batches += 1
 
-        avg_train_loss = total_loss / num_batches
-        avg_train_f1 = total_f1 / num_batches
-        val_loss, val_f1 = evaluate(model, val_loader, criterion, device, vocab)
+        avg_train_loss = total_loss / total_words
+        train_perplexity = math.exp(avg_train_loss)
+        val_loss, val_perplexity = evaluate(model, val_loader, criterion, device, vocab)
 
         wandb.log(
             {
                 "epoch": epoch,
                 "train_loss": avg_train_loss,
-                "train_f1": avg_train_f1,
+                "train_perplexity": train_perplexity,
                 "val_loss": val_loss,
-                "val_f1": val_f1,
+                "val_perplexity": val_perplexity,
                 "learning_rate": scheduler.get_last_lr()[0],
             }
         )
 
         print(
-            f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Train F1: {avg_train_f1:.4f}, Val Loss: {val_loss:.4f}, Val F1: {val_f1:.4f}"
+            f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Train Perplexity: {train_perplexity:.4f}, Val Loss: {val_loss:.4f}, Val Perplexity: {val_perplexity:.4f}"
         )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), "best_hisa_model.pth")
+            torch.save(
+                model.state_dict(), f"best_{ model.__class__.__name__}_model.pth"
+            )
             print("Best model saved!")
 
 
 def evaluate(model, data_loader, criterion, device, vocab):
     model.eval()
     total_loss = 0
-    total_f1 = 0
     num_batches = 0
+    total_words = 0
     with torch.no_grad():
         for batch in data_loader:
             inputs, targets = batch
             output = model(inputs)
             loss = criterion(output.view(-1, output.size(-1)), targets.view(-1))
-            total_loss += loss.item()
-            f1 = calculate_f1(output, targets, vocab)
-            total_f1 += f1
-            num_batches += 1
-    return total_loss / num_batches, total_f1 / num_batches
-
-
-def calculate_perplexity(model, data_loader, criterion, device):
-    model.eval()
-    total_loss = 0.0
-    total_words = 0
-    start_time = time.time()
-
-    with torch.no_grad():
-        for batch in data_loader:
-            inputs, targets = batch
-            inputs, targets = inputs.to(device), targets.to(device)
-
-            outputs = model(inputs)
-            loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
-
             total_loss += loss.item() * targets.numel()
             total_words += targets.numel()
-
+            num_batches += 1
     avg_loss = total_loss / total_words
     perplexity = math.exp(avg_loss)
-
-    elapsed_time = time.time() - start_time
-    words_per_second = total_words / elapsed_time
-
-    print(f"Perplexity: {perplexity:.3f}")
-    print(f"Speed: {words_per_second:.0f} words/sec")
-
-    return perplexity
+    return avg_loss, perplexity
 
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def main():
-    wandb.init(project="hisa-ptb")
+def main(name):
+    wandb.init(project="hisa-transformer-ptb", name=name)
 
     # Hyperparameters
     batch_size = 32
@@ -212,8 +194,7 @@ def main():
         collate_fn=lambda b: collate_batch(b, vocab, device),
     )
 
-    # Initialize the model
-    model = HiSAForPTB(len(vocab), d_model, nhead, num_layers, dropout).to(device)
+    model = get_model(len(vocab), d_model, nhead, num_layers, dropout, name).to(device)
 
     # Optimizer and loss function
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -239,8 +220,10 @@ def main():
             "scheduler": scheduler.__class__.__name__,
             "warmup_steps": warmup_steps,
             "vocab_size": len(vocab),
+            "model": model.__class__.__name__,
         }
     )
+
     try:
         train(
             model,
@@ -255,19 +238,14 @@ def main():
         )
     except KeyboardInterrupt:
         print("Training interrupted")
-    # Load the best model and evaluate on test set
-    model.load_state_dict(torch.load("best_hisa_model.pth"))
-    test_loss, test_f1 = evaluate(model, test_loader, criterion, device, vocab)
-    print(f"Final Test Loss: {test_loss:.4f}, Test F1: {test_f1:.4f}")
 
-    test_perplexity = calculate_perplexity(model, test_loader, criterion, device)
-    print(f"Test Perplexity: {test_perplexity:.2f}")
-    wandb.log(
-        {"test_perplexity": test_perplexity, "test_loss": test_loss, "test_f1": test_f1}
-    )
+    model.load_state_dict(torch.load(f"best_{ model.__class__.__name__}_model.pth"))
+    test_loss, test_perplexity = evaluate(model, test_loader, criterion, device, vocab)
+    print(f"Final Test Loss: {test_loss:.4f}, Perplexity: {test_perplexity:.4f}")
+    wandb.log({"test_perplexity": test_perplexity, "test_loss": test_loss})
 
     wandb.finish()
 
 
 if __name__ == "__main__":
-    main()
+    main(name="hisa")
