@@ -20,6 +20,8 @@ config = {
     "lr": 1e-4,
     "vocab_size": 32000,
     "seq_length": 512,
+    "sparsity": 0.9,
+    "use_sparse": False,
     "model_name": "HiSAGPT_PoC",
     "dataset_fraction": 0.1,  # Use only 10% of the dataset
 }
@@ -157,11 +159,13 @@ def main():
         config["nhead"],
         config["num_layers"],
         config["dropout"],
+        use_sparse=config["use_sparse"],
+        sparsity=config["sparsity"],
     ).to(device)
 
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Params: {params}")
-    wandb.init(project="hisa_gpt_poc", config=config)
+    wandb.init(project="hisa_gpt_poc", name="ablated", config=config)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config["lr"], weight_decay=0.01

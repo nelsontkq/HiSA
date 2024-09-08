@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class PositionalEncoding(nn.Module):
@@ -63,6 +64,40 @@ class SparseMultiheadAttention(nn.Module):
         return self.W_o(attn_output)
 
 
+class DenseAttention(nn.Module):
+    def __init__(self, d_model, nhead, dropout=0.1):
+        super().__init__()
+        assert d_model % nhead == 0
+        self.d_model = d_model
+        self.nhead = nhead
+        self.d_k = d_model // nhead
+
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+        self.dropout = dropout
+
+    def forward(self, query, key, value):
+        batch_size, seq_len, _ = query.shape
+
+        Q = self.W_q(query).view(batch_size, -1, self.nhead, self.d_k).transpose(1, 2)
+        K = self.W_k(key).view(batch_size, -1, self.nhead, self.d_k).transpose(1, 2)
+        V = self.W_v(value).view(batch_size, -1, self.nhead, self.d_k).transpose(1, 2)
+
+        attn_output = F.scaled_dot_product_attention(
+            Q, K, V, dropout_p=self.dropout if self.training else 0.0
+        )
+
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, seq_len, self.d_model)
+        )
+        return self.W_o(attn_output)
+
+
 class FeedForward(nn.Module):
     def __init__(self, d_model, dropout=0.1):
         super().__init__()
@@ -78,9 +113,14 @@ class FeedForward(nn.Module):
 
 
 class HiSABlock(nn.Module):
-    def __init__(self, d_model, nhead, dropout=0.1):
+    def __init__(self, d_model, nhead, dropout=0.1, use_sparse=True, sparsity=0.9):
         super().__init__()
-        self.self_attn = SparseMultiheadAttention(d_model, nhead, dropout=dropout)
+        if use_sparse:
+            self.self_attn = SparseMultiheadAttention(
+                d_model, nhead, dropout=dropout, sparsity=sparsity
+            )
+        else:
+            self.self_attn = DenseAttention(d_model, nhead, dropout=dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.ff = FeedForward(d_model, dropout)
@@ -91,35 +131,27 @@ class HiSABlock(nn.Module):
         return x
 
 
-class HiSAForPTB(nn.Module):
-    def __init__(self, vocab_size, d_model=256, nhead=4, num_layers=2, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, dropout)
-        self.transformer_blocks = nn.ModuleList(
-            [HiSABlock(d_model, nhead, dropout) for _ in range(num_layers)]
-        )
-        self.fc_out = nn.Linear(d_model, vocab_size)
-
-    def forward(self, src):
-        x = self.embedding(src) * math.sqrt(self.d_model)
-        x = self.pos_encoder(x)
-        for block in self.transformer_blocks:
-            x = block(x)
-        return self.fc_out(x)
-
-
 class HiSAGPT(nn.Module):
     def __init__(
-        self, vocab_size, d_model, nhead, num_layers, dropout, use_checkpoint=False
+        self,
+        vocab_size,
+        d_model,
+        nhead,
+        num_layers,
+        dropout,
+        use_sparse=True,
+        sparsity=0.9,
+        use_checkpoint=False,
     ):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoder = PositionalEncoding(d_model, dropout)
         self.d_model = d_model
         self.transformer_blocks = nn.ModuleList(
-            [HiSABlock(d_model, nhead, dropout) for _ in range(num_layers)]
+            [
+                HiSABlock(d_model, nhead, dropout, use_sparse, sparsity)
+                for _ in range(num_layers)
+            ]
         )
         self.fc_out = nn.Linear(d_model, vocab_size)
         self.vocab_size = vocab_size
