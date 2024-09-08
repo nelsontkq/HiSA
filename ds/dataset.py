@@ -1,7 +1,8 @@
 import os
 from pathlib import Path
+import random
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 from datasets import load_dataset
 import sentencepiece as spm
 
@@ -67,12 +68,23 @@ def get_tokenizer(vocab_size=32000, max_sentence_length=8384):
         sp.load(f"wikitext_sp_{vocab_size}.model")
 
     return sp, sp.get_piece_size()
+def create_subset_loader(original_dataset, fraction, batch_size):
+    subset_size = int(len(original_dataset) * fraction)
+    subset_indices = random.sample(range(len(original_dataset)), subset_size)
+    subset = Subset(original_dataset, subset_indices)
+    return DataLoader(subset, batch_size=batch_size, shuffle=True)
 
-
-def get_dataloaders(tokenizer, batch_size, seq_length, num_workers=4):
+def get_dataloaders(tokenizer, batch_size, seq_length, num_workers=4, dataset_fraction=1.0):
     train_dataset = WikiTextDataset("train", tokenizer, seq_length)
     val_dataset = WikiTextDataset("validation", tokenizer, seq_length)
     test_dataset = WikiTextDataset("test", tokenizer, seq_length)
+
+    if dataset_fraction < 1.0:
+        train_subset_loader = create_subset_loader(train_dataset, dataset_fraction, batch_size)
+        val_subset_loader = create_subset_loader(val_dataset, dataset_fraction, batch_size)
+        test_subset_loader = create_subset_loader(test_dataset, dataset_fraction, batch_size)
+
+        return train_subset_loader, val_subset_loader, test_subset_loader
 
     train_loader = DataLoader(
         train_dataset,
