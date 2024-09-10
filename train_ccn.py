@@ -16,14 +16,14 @@ import gc
 import numpy as np
 
 # Hyperparameters
-BATCH_SIZE = 16
+BATCH_SIZE = 12
 EPOCHS = 100
 CLIP = 0.25
-BLOCK_SIZE = 1024
+BLOCK_SIZE = 2048
 NUM_RUNS = 5
 EARLY_STOP_PATIENCE = 3
-MAX_LOSS_THRESHOLD = 1000  # Maximum acceptable loss value
-MIN_IMPROVEMENT_THRESHOLD = 0.001  # Minimum improvement in loss to continue training
+MAX_LOSS_THRESHOLD = 500
+MIN_IMPROVEMENT_THRESHOLD = 0.2
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -54,24 +54,28 @@ def train(model, train_loader, criterion, optimizer, epoch):
         output = model(data)
         loss = criterion(output.view(-1, output.size(-1)), targets.view(-1))
         
-        if batch != 0 and (torch.isnan(loss) or loss.item() > MAX_LOSS_THRESHOLD):
-            print(f"Training failed: Loss is {loss.item()}")
-            return None
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
         optimizer.step()
 
         total_loss += loss.item()
-        
+
+        if torch.isnan(loss) or loss.item() > MAX_LOSS_THRESHOLD:
+            print(f"Training failed: Loss is {loss.item()}")
+            return None
         if batch % (len(train_loader) // 10) == 0 and batch > 0:
+            
             cur_loss = total_loss / (len(train_loader) // 10)
             elapsed = time.time() - start_time
+            ppl = safe_exp(cur_loss)
+            if ppl == float('inf'):
+                return float('inf')
             progress_bar.set_postfix({
                 "lr": optimizer.param_groups[0]["lr"],
                 "ms/batch": elapsed * 1000 / (len(train_loader) // 10),
                 "loss": cur_loss,
-                "ppl": safe_exp(cur_loss),
+                "ppl": ppl,
             })
             total_loss = 0
             start_time = time.time()
@@ -141,6 +145,7 @@ def objective(trial, model_class, train_loader, val_loader, criterion, tokenizer
 
     best_val_loss = float('inf')
     no_improvement_count = 0
+    print(config)
     for epoch in range(10):
         train_loss = train(model, train_loader, criterion, optimizer, epoch)
         if train_loss is None:  # Training failed
@@ -157,7 +162,7 @@ def objective(trial, model_class, train_loader, val_loader, criterion, tokenizer
         if no_improvement_count >= EARLY_STOP_PATIENCE:
             print(f"Early stopping at epoch {epoch}")
             break
-    wandb.log({"objective": {"val_loss": val_loss, "config":config}})
+    wandb.log({"best_val_loss": best_val_loss})
 
     del model, optimizer
     gc.collect()
@@ -188,7 +193,7 @@ def run_experiment(model_class, params, train_loader, val_loader, test_loader, c
         train_losses = []
         val_losses = []
         no_improvement_count = 0
-        
+        print(params)
         for epoch in range(1, EPOCHS + 1):
             train_loss = train(model, train_loader, criterion, optimizer, epoch)
             if train_loss is None:  # Training failed
