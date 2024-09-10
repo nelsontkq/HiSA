@@ -13,6 +13,7 @@ from scipy import stats
 import matplotlib.pyplot as plt
 from nltk.translate.bleu_score import corpus_bleu
 import gc
+import numpy as np
 
 # Hyperparameters
 BATCH_SIZE = 16
@@ -20,6 +21,9 @@ EPOCHS = 100
 CLIP = 0.25
 BLOCK_SIZE = 1024
 NUM_RUNS = 5
+EARLY_STOP_PATIENCE = 3
+MAX_LOSS_THRESHOLD = 1000  # Maximum acceptable loss value
+MIN_IMPROVEMENT_THRESHOLD = 0.001  # Minimum improvement in loss to continue training
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -29,20 +33,16 @@ def safe_exp(x):
     except OverflowError:
         return float('inf')
 
-
 def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
 def train(model, train_loader, criterion, optimizer, epoch):
     model.train()
     total_loss = 0.0
     start_time = time.time()
-    progress_bar = tqdm(
-        enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}"
-    )
+    progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}")
 
     for batch, data in progress_bar:
         data = data.to(device)
@@ -53,31 +53,33 @@ def train(model, train_loader, criterion, optimizer, epoch):
         optimizer.zero_grad()
         output = model(data)
         loss = criterion(output.view(-1, output.size(-1)), targets.view(-1))
+        
+        if batch != 0 and (torch.isnan(loss) or loss.item() > MAX_LOSS_THRESHOLD):
+            print(f"Training failed: Loss is {loss.item()}")
+            return None
+        
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
         optimizer.step()
 
         total_loss += loss.item()
+        
         if batch % (len(train_loader) // 10) == 0 and batch > 0:
             cur_loss = total_loss / (len(train_loader) // 10)
             elapsed = time.time() - start_time
-            progress_bar.set_postfix(
-                {
-                    "lr": optimizer.param_groups[0]["lr"],
-                    "ms/batch": elapsed * 1000 / (len(train_loader) // 10),
-                    "loss": cur_loss,
-                    "ppl": safe_exp(cur_loss),
-                }
-            )
+            progress_bar.set_postfix({
+                "lr": optimizer.param_groups[0]["lr"],
+                "ms/batch": elapsed * 1000 / (len(train_loader) // 10),
+                "loss": cur_loss,
+                "ppl": safe_exp(cur_loss),
+            })
             total_loss = 0
             start_time = time.time()
 
-        # Clear GPU cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     return cur_loss
-
 
 def evaluate(model, eval_loader, criterion):
     model.eval()
@@ -93,7 +95,6 @@ def evaluate(model, eval_loader, criterion):
             loss = criterion(output.view(-1, output.size(-1)), targets.view(-1)).item()
             total_loss += loss
 
-            # Clear GPU cache
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -127,46 +128,54 @@ def objective(trial, model_class, train_loader, val_loader, criterion, tokenizer
         "vocab_size": tokenizer.get_piece_size(),
         "dim": trial.suggest_int("dim", 32, 256),
         "num_layers": trial.suggest_int("num_layers", 2, 6),
-        "learning_rate": trial.suggest_loguniform("learning_rate", 1e-5, 1e-2),
+        "learning_rate": trial.suggest_loguniform("learning_rate", 1e-5, 1e-3),
     }
     if model_class.__name__ == "CCN":
-        config["num_beams"] = trial.suggest_int("num_beams", 2, 12)
+        config["num_beams"] = trial.suggest_int("num_beams", 4, 12)
     else:
         config["num_heads"] = trial.suggest_int("num_heads", 1, 8)
-        config["dim"] = config["dim"] - (config["dim"] % num_heads)
-    model = model_class(**{k: v for k, v in config.items() if k != "learning_rate"}).to(
-        device
-    )
+        config["dim"] = config["dim"] - (config["dim"] % config["num_heads"])
+    
+    model = model_class(**{k: v for k, v in config.items() if k != "learning_rate"}).to(device)
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
 
+    best_val_loss = float('inf')
+    no_improvement_count = 0
     for epoch in range(10):
-        train(model, train_loader, criterion, optimizer, epoch)
+        train_loss = train(model, train_loader, criterion, optimizer, epoch)
+        if train_loss is None:  # Training failed
+            return float('inf')
+        
+        val_loss = evaluate(model, val_loader, criterion)
+        
+        if val_loss < best_val_loss * (1 - MIN_IMPROVEMENT_THRESHOLD):
+            best_val_loss = val_loss
+            no_improvement_count = 0
+        else:
+            no_improvement_count += 1
+        
+        if no_improvement_count >= EARLY_STOP_PATIENCE:
+            print(f"Early stopping at epoch {epoch}")
+            break
+    wandb.log({"objective": {"val_loss": val_loss, "config":config}})
 
-    val_loss = evaluate(model, val_loader, criterion)
-
-    # Clear memory
     del model, optimizer
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return val_loss
-
+    return best_val_loss
 
 def tune_hyperparameters(model_class, train_loader, val_loader, criterion, tokenizer):
     study = optuna.create_study(direction="minimize")
     study.optimize(
-        lambda trial: objective(
-            trial, model_class, train_loader, val_loader, criterion, tokenizer
-        ),
+        lambda trial: objective(trial, model_class, train_loader, val_loader, criterion, tokenizer),
         n_trials=20,
+        catch=(RuntimeError, ValueError)  # Catch common PyTorch errors
     )
     return study.best_params
 
-
-def run_experiment(
-    model_class, params, train_loader, val_loader, test_loader, criterion, tokenizer
-):
+def run_experiment(model_class, params, train_loader, val_loader, test_loader, criterion, tokenizer):
     results = []
     for run in range(NUM_RUNS):
         set_seed(run)
@@ -178,38 +187,51 @@ def run_experiment(
         best_val_loss = float("inf")
         train_losses = []
         val_losses = []
+        no_improvement_count = 0
+        
         for epoch in range(1, EPOCHS + 1):
             train_loss = train(model, train_loader, criterion, optimizer, epoch)
+            if train_loss is None:  # Training failed
+                print(f"Training failed for {model_class.__name__} in run {run}")
+                break
+            
             val_loss = evaluate(model, val_loader, criterion)
             train_losses.append(train_loss)
             val_losses.append(val_loss)
 
-            if val_loss < best_val_loss:
+            if val_loss < best_val_loss * (1 - MIN_IMPROVEMENT_THRESHOLD):
                 best_val_loss = val_loss
-                torch.save(
-                    model.state_dict(), f"{model_class.__name__}_model_run{run}.pt"
-                )
+                torch.save(model.state_dict(), f"{model_class.__name__}_model_run{run}.pt")
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
 
             scheduler.step()
 
-            if epoch > 5 and val_losses[-1] > val_losses[-6]:  # Early stopping
+            if no_improvement_count >= EARLY_STOP_PATIENCE:
+                print(f"Early stopping at epoch {epoch} for {model_class.__name__} in run {run}")
                 break
 
-        model.load_state_dict(torch.load(f"{model_class.__name__}_model_run{run}.pt"))
-        test_loss = evaluate(model, test_loader, criterion)
-        bleu_score = calculate_bleu(model, test_loader, tokenizer)
-        results.append((test_loss, bleu_score))
+        if train_loss is not None:  # Only evaluate if training didn't fail
+            model.load_state_dict(torch.load(f"{model_class.__name__}_model_run{run}.pt"))
+            test_loss = evaluate(model, test_loader, criterion)
+            bleu_score = calculate_bleu(model, test_loader, tokenizer)
+            results.append((test_loss, bleu_score))
 
-        plt.plot(train_losses, label="Train Loss")
-        plt.plot(val_losses, label="Validation Loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.savefig(f"{model_class.__name__}_learning_curve_run{run}.png")
-        plt.close()
+            plt.plot(train_losses, label="Train Loss")
+            plt.plot(val_losses, label="Validation Loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.savefig(f"{model_class.__name__}_learning_curve_run{run}.png")
+            plt.close()
+
+        del model, optimizer, scheduler
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return results
-
 
 def main():
     train_dataset, val_dataset, test_dataset, tokenizer = prepare_data(BLOCK_SIZE)
@@ -245,7 +267,13 @@ def main():
         criterion,
         tokenizer,
     )
+    if not ccn_results:
+        print("All CCN runs failed. Exiting early.")
+        return
 
+    if not transformer_results:
+        print("All Transformer runs failed. Exiting early.")
+        return
     ccn_losses, ccn_bleu = zip(*ccn_results)
     transformer_losses, transformer_bleu = zip(*transformer_results)
 
@@ -282,7 +310,6 @@ def main():
     )
 
     wandb.finish()
-
 
 if __name__ == "__main__":
     main()
