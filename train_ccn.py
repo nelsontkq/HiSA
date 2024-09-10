@@ -179,7 +179,6 @@ def tune_hyperparameters(model_class, train_loader, val_loader, criterion, token
         catch=(RuntimeError, ValueError)  # Catch common PyTorch errors
     )
     return study.best_params
-
 def run_experiment(model_class, params, train_loader, val_loader, test_loader, criterion, tokenizer):
     results = []
     for run in range(NUM_RUNS):
@@ -204,6 +203,13 @@ def run_experiment(model_class, params, train_loader, val_loader, test_loader, c
             train_losses.append(train_loss)
             val_losses.append(val_loss)
 
+            # Log metrics to wandb
+            wandb.log({
+                f"{model_class.__name__}_run_{run}_train_loss": train_loss,
+                f"{model_class.__name__}_run_{run}_val_loss": val_loss,
+                f"{model_class.__name__}_run_{run}_epoch": epoch
+            })
+
             if val_loss < best_val_loss * (1 - MIN_IMPROVEMENT_THRESHOLD):
                 best_val_loss = val_loss
                 torch.save(model.state_dict(), f"{model_class.__name__}_model_run{run}.pt")
@@ -223,12 +229,22 @@ def run_experiment(model_class, params, train_loader, val_loader, test_loader, c
             bleu_score = calculate_bleu(model, test_loader, tokenizer)
             results.append((test_loss, bleu_score))
 
+            # Log test metrics to wandb
+            wandb.log({
+                f"{model_class.__name__}_run_{run}_test_loss": test_loss,
+                f"{model_class.__name__}_run_{run}_bleu_score": bleu_score
+            })
+
             plt.plot(train_losses, label="Train Loss")
             plt.plot(val_losses, label="Validation Loss")
             plt.xlabel("Epoch")
             plt.ylabel("Loss")
             plt.legend()
             plt.savefig(f"{model_class.__name__}_learning_curve_run{run}.png")
+            
+            # Log learning curve to wandb
+            wandb.log({f"{model_class.__name__}_run_{run}_learning_curve": wandb.Image(plt)})
+            
             plt.close()
 
         del model, optimizer, scheduler
@@ -245,23 +261,33 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
     criterion = nn.CrossEntropyLoss()
 
-    wandb.init(project="ccn-vs-transformer-extended")
+    wandb.init(project="ccn-vs-transformer-extended", config={
+        "BATCH_SIZE": BATCH_SIZE,
+        "EPOCHS": EPOCHS,
+        "CLIP": CLIP,
+        "BLOCK_SIZE": BLOCK_SIZE,
+        "NUM_RUNS": NUM_RUNS,
+        "EARLY_STOP_PATIENCE": EARLY_STOP_PATIENCE,
+        "MAX_LOSS_THRESHOLD": MAX_LOSS_THRESHOLD,
+        "MIN_IMPROVEMENT_THRESHOLD": MIN_IMPROVEMENT_THRESHOLD
+    })
 
+    print("Running experiments for CCN...")
+    
     print("Tuning hyperparameters for CCN...")
     ccn_params = tune_hyperparameters(
         CCN, train_loader, val_loader, criterion, tokenizer
     )
     print("Tuning hyperparameters for Transformer...")
     wandb.log({ccn_params})
-    transformer_params = tune_hyperparameters(
-        TransformerBaseline, train_loader, val_loader, criterion, tokenizer
-    )
-    wandb.log({transformer_params})
 
-    print("Running experiments for CCN...")
+    wandb.config.update({"ccn_params": ccn_params})
     ccn_results = run_experiment(
         CCN, ccn_params, train_loader, val_loader, test_loader, criterion, tokenizer
     )
+
+    transformer_params={'dim': 132, 'num_layers': 6, "learning_rate": 1e-04, 'num_heads': 3}
+    wandb.config.update({"transformer_params": transformer_params})
     print("Running experiments for Transformer...")
     transformer_results = run_experiment(
         TransformerBaseline,
@@ -272,13 +298,6 @@ def main():
         criterion,
         tokenizer,
     )
-    if not ccn_results:
-        print("All CCN runs failed. Exiting early.")
-        return
-
-    if not transformer_results:
-        print("All Transformer runs failed. Exiting early.")
-        return
     ccn_losses, ccn_bleu = zip(*ccn_results)
     transformer_losses, transformer_bleu = zip(*transformer_results)
 
@@ -313,6 +332,21 @@ def main():
             "bleu_p_value": p_value_bleu,
         }
     )
+
+    # Create and log summary plots
+    plt.figure(figsize=(10, 6))
+    plt.boxplot([ccn_losses, transformer_losses], labels=['CCN', 'Transformer'])
+    plt.title('Test Loss Comparison')
+    plt.ylabel('Loss')
+    wandb.log({"test_loss_comparison": wandb.Image(plt)})
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    plt.boxplot([ccn_bleu, transformer_bleu], labels=['CCN', 'Transformer'])
+    plt.title('BLEU Score Comparison')
+    plt.ylabel('BLEU Score')
+    wandb.log({"bleu_score_comparison": wandb.Image(plt)})
+    plt.close()
 
     wandb.finish()
 
